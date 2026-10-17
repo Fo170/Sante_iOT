@@ -1,6 +1,6 @@
 {
   "name": "Sante_iOT",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "État de santé d'un iOT (header-only) : agrège compteurs ESP-NOW (reçus/traités/validés/rejetés/débordés), variables applicatives via pointeurs (t_fct, rssi_moy, heap...) et valeurs génériques enregistrables. Rapport texte (Telegram), résumé 1 ligne, JSON ArduinoJson v7. Score de santé 0-100 + seuils configurables.",
   "keywords": ["health", "sante", "monitoring", "esp-now", "telemetry", "iot"],
   "authors": [
