@@ -1,0 +1,20 @@
+{
+  "name": "Sante_iOT",
+  "version": "1.0.0",
+  "description": "État de santé d'un iOT (header-only) : agrège compteurs ESP-NOW (reçus/traités/validés/rejetés/débordés), variables applicatives via pointeurs (t_fct, rssi_moy, heap...) et valeurs génériques enregistrables. Rapport texte (Telegram), résumé 1 ligne, JSON ArduinoJson v7. Score de santé 0-100 + seuils configurables.",
+  "keywords": ["health", "sante", "monitoring", "esp-now", "telemetry", "iot"],
+  "authors": [
+    {
+      "name": "Olivier FOURNET",
+      "email": "olivier.fournet@free.fr",
+      "url": "https://github.com/Fo170"
+    }
+  ],
+  "license": "GPL-3.0-only",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif8266", "espressif32"],
+  "headers": ["Sante_iOT.h"],
+  "export": {
+    "exclude": [".pio", "exemples"]
+  }
+}
