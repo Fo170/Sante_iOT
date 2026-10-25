@@ -80,8 +80,33 @@
 
 
 // Version de la librairie (source UNIQUE — agrégée par liste_lib.h)
-#define __SANTE_IOT_H_VERSION__ "1.0.1"
+#define __SANTE_IOT_H_VERSION__ "1.1.0"
 #include <Arduino.h>
+
+// ----------------------------------------------------------------------------
+// StringPrint — adaptateur `Print` → `String`
+//
+// ⚠️ NÉCESSAIRE : en Arduino, `String` n'hérite PAS de `Print` (elle a
+//    `concat()` mais pas `write()`). Sans cet adaptateur, les surcharges
+//    `String` ne pourraient pas déléguer aux surcharges `Print&`, et la logique
+//    de formatage devrait être écrite DEUX fois.
+//    ESP8266 fournit `StringPrint` dans le core ; ESP32 non → définition locale
+//    protégée par #ifndef pour ne pas entrer en collision sur ESP8266.
+// ----------------------------------------------------------------------------
+#ifndef SANTE_STRINGPRINT_DEFINI
+#define SANTE_STRINGPRINT_DEFINI
+class Sante_StringPrint : public Print {
+public:
+  explicit Sante_StringPrint(String& cible) : _s(cible) {}
+  size_t write(uint8_t c) override { _s += (char)c; return 1; }
+  size_t write(const uint8_t* d, size_t n) override {
+    if (d && n) _s.concat((const char*)d, n);
+    return n;
+  }
+private:
+  String& _s;
+};
+#endif
 
 class Sante_iOT {
 public:
@@ -97,6 +122,16 @@ public:
   void setUptimePtr(float* p)      { _uptime = p; }        // ex. &t_fct (s)
   void setRssiMoyPtr(int8_t* p)    { _rssi = p; }          // ex. &rssi_moy (dBm)
   void setHeapPtr(uint32_t* p)     { _heap = p; }          // ex. &heap_libre (octets)
+
+  // ── Getters (v1.1.0-local) : alternative aux pointeurs sur globales ──────
+  // ⚠️ POURQUOI : les pointeurs obligent le programme à maintenir une globale à
+  //    jour (une écriture par boucle) pour une valeur qu'il sait déjà lire à la
+  //    demande. Un getter évite cette globale ET la désynchronisation.
+  //    Ex. : sante.setHeapGetter([]() -> uint32_t { return CM_Mesure().libre; });
+  //    Priorité : getter > pointeur (si les deux sont fournis).
+  void setHeapGetter(uint32_t (*f)()) { _heapGet = f; }
+  void setRssiGetter(int8_t (*f)())   { _rssiGet = f; }
+  void setUptimeGetter(float (*f)())  { _uptimeGet = f; }
 
   // --------------------------------------------------------------------------
   //  Attachement des compteurs ESP-NOW (pointeurs de fonction — découplé)
@@ -173,7 +208,10 @@ public:
     return (tot == 0) ? 1.0f : (float)data / (float)tot;
   }
 
-  /** Âge (s) de la dernière donnée reçue ; 0xFFFFFFFF si jamais reçue. */
+  /** Âge (s) de la dernière donnée reçue ; 0xFFFFFFFF si jamais reçue.
+   *  ⚠️ Vaut aussi 0xFFFFFFFF quand ESP-NOW n'est PAS attaché — c'est pourquoi
+   *  `espNowAttache()` existe : les pénalités ESP-NOW ne doivent s'appliquer
+   *  que si la source de données existe réellement. */
   uint32_t ageDerniereRecv() const {
     if (!_es.derniereRecvMs) return 0xFFFFFFFF;
     uint32_t last = _es.derniereRecvMs();
@@ -181,32 +219,68 @@ public:
     return (uint32_t)((millis() - last) / 1000);
   }
 
-  /** Score global 0..100 : 100 = parfait. */
+  /** true si des compteurs ESP-NOW ont été attachés (au moins le compteur total). */
+  bool espNowAttache() const { return _es.rxTotal != nullptr; }
+
+  /** true si une source de « dernière réception » est attachée. */
+  bool receptionAttachee() const { return _es.derniereRecvMs != nullptr; }
+
+  // --------------------------------------------------------------------------
+  //  Score de santé 0..100
+  //
+  //  ⚠️ DEUX DÉFAUTS CORRIGÉS ICI (v1.1.0-local, 25/10/2026) :
+  //
+  //  B1 — SOUS-DÉBORDEMENT uint8_t. L'ancien code faisait
+  //       `s = (uint8_t)(s - 15);` : quand s valait déjà 5, s-15 donnait 246,
+  //       puis `if (s > 100) s = 100;` RAMENAIT LE SCORE À 100. Un appareil
+  //       très dégradé s'annonçait donc EN PARFAITE SANTÉ — le pire cas
+  //       possible pour un indicateur de santé. Corrigé : arithmétique SIGNÉE
+  //       (int16_t) + bornage bas, et aucune remontée possible.
+  //
+  //  B2 — ESP-NOW IMPOSÉ. `ageDerniereRecv()` renvoie 0xFFFFFFFF quand aucun
+  //       compteur n'est attaché, et le score appliquait `s = 20`. Résultat :
+  //       toute carte SANS ESP-NOW (ESP32_TELEGRAM, Thermometre, Relais…)
+  //       plafonnait à 20/100 et `enSante()` était TOUJOURS faux. Corrigé :
+  //       les pénalités ESP-NOW ne s'appliquent que si `espNowAttache()`.
+  //
+  //  La sémantique retenue est celle d'une NOTE : on part de 100 et on RETIRE
+  //  des points. Aucun critère ne peut REMONTER le score (les anciennes
+  //  affectations `s = 40` / `s = 30` écrasaient les pénalités précédentes).
+  // --------------------------------------------------------------------------
   uint8_t scoreGlobal() const {
-    uint8_t s = 100;
+    int16_t s = 100;
 
-    // RSSI
-    if (_rssi && *_rssi < _rssiMin) {
-      uint8_t d = (uint8_t)(_rssiMin - *_rssi);
-      s = (d >= 20) ? 20 : s - d * 2;
-    }
-    // Heap
-    if (_heap && *_heap < _heapMin) {
-      s = 40;
-    }
-    // Perte RX ESP-NOW
-    float p = tauxPerteRx();
-    if (p > _perteMax) s = 30;
-    else if (p > _perteMax * 0.5f) s = (uint8_t)(s - 20);
-    // Validité données
-    if (tauxValiditeDonnees() < 0.7f) s = (uint8_t)(s - 15);
-    // Dernière réception
-    uint32_t age = ageDerniereRecv();
-    if (age == 0xFFFFFFFF) s = 20;
-    else if (age > 120) s = 40;
+    // ── WiFi : non connecté = pénalité majeure (rien ne fonctionne sans lui)
+    if (_wifi.connecte && !_wifi.connecte()) s -= 40;
 
+    // ── RSSI : −2 points par dB sous le seuil, plafonné à −40
+    if (rssiPresente()) {
+      int8_t r = rssiVal();
+      if (r < _rssiMin) {
+        int16_t d = (int16_t)(_rssiMin - r);
+        s -= (d >= 20) ? 40 : (int16_t)(d * 2);
+      }
+    }
+
+    // ── Heap : −60 sous le seuil (une carte sans heap ne peut plus servir)
+    if (heapPresent()) {
+      if (heapVal() < _heapMin) s -= 60;
+    }
+
+    // ── ESP-NOW : uniquement si la source existe (B2)
+    if (espNowAttache()) {
+      float p = tauxPerteRx();
+      if (p > _perteMax)                    s -= 40;
+      else if (p > _perteMax * 0.5f)        s -= 20;
+      if (tauxValiditeDonnees() < 0.7f)     s -= 15;
+      uint32_t age = ageDerniereRecv();
+      if (age == 0xFFFFFFFF)                s -= 40;   // jamais reçu
+      else if (age > 120)                   s -= 30;
+    }
+
+    if (s < 0)   s = 0;
     if (s > 100) s = 100;
-    return s;
+    return (uint8_t)s;
   }
 
   /** true si tous les critères de santé sont bons. */
@@ -218,87 +292,106 @@ public:
   //  Sorties
   // --------------------------------------------------------------------------
 
-  /** Rapport texte multi-lignes (Telegram, /etat, MCP). */
-  String rapport() const {
-    String s = "\n=== SANTÉ iOT ===\n";
-    s += _nom; s += " v"; s += _version; s += "\n";
-    if (_uptime) { s += "Uptime: "; s += String(*_uptime, 1); s += " s\n"; }
-    if (_rssi)   { s += "RSSI moy: "; s += String(*_rssi); s += " dBm\n"; }
-    if (_heap)   { s += "Heap libre: "; s += String(*_heap); s += " B\n"; }
+  /** Rapport texte multi-lignes — version FLUX (v1.1.0-local).
+   *  Aucune String allouée : l'appelant fournit Serial / le client HTTP.
+   *  ⚠️ `Print` n'est pas un type Arduino pour ESP8266/ESP32 : c'est bien
+   *  `Print` de `Print.h`, fourni par le core. Disponible sur les deux. */
+  void rapport(Print& out) const {
+    out.print(F("\n=== SANTÉ iOT ===\n"));
+    out.print(_nom); out.print(F(" v")); out.print(_version); out.print('\n');
+    if (uptimePresent()) { out.print(F("Uptime: ")); out.print((double)uptimeVal(), 1); out.print(F(" s\n")); }
+    if (rssiPresente())  { out.print(F("RSSI moy: ")); out.print((int)rssiVal()); out.print(F(" dBm\n")); }
+    if (heapPresent())   { out.print(F("Heap libre: ")); out.print((unsigned long)heapVal()); out.print(F(" B\n")); }
 
     // Bloc WiFi (infos/logs WiFiManagerESP)
     if (_wifi.connecte || _wifi.resets) {
-      s += "[WiFi] ";
-      if (_wifi.connecte) { s += _wifi.connecte() ? "connecté ✅" : "PAS_CONNECTÉ ❌"; }
-      if (_wifi.ssid)     { s += " "; s += _wifi.ssid(); }
-      if (_wifi.rssi)     { s += " RSSI="; s += String(_wifi.rssi()); s += " dBm"; }
-      s += "\n";
+      out.print(F("[WiFi] "));
+      if (_wifi.connecte) { out.print(_wifi.connecte() ? F("connecté ✅") : F("PAS_CONNECTÉ ❌")); }
+      if (_wifi.ssid)     { out.print(' '); out.print(_wifi.ssid()); }
+      if (_wifi.rssi)     { out.print(F(" RSSI=")); out.print((int)_wifi.rssi()); out.print(F(" dBm")); }
+      out.print('\n');
       if (_wifi.resets) {
-        s += "  resets WiFi="; s += String(_wifi.resets());
+        out.print(F("  resets WiFi=")); out.print((unsigned long)_wifi.resets());
         if (_wifi.dernierResetMs) {
           unsigned long t = _wifi.dernierResetMs();
-          s += " (dernier il y a "; s += String((millis() - t) / 1000); s += " s)";
+          out.print(F(" (dernier il y a ")); out.print((unsigned long)((millis() - t) / 1000)); out.print(F(" s)"));
         }
-        s += "\n";
+        out.print('\n');
       }
-      if (_wifi.logs) { s += _wifi.logs(); s += "\n"; }
+      if (_wifi.logs) { out.print(_wifi.logs()); out.print('\n'); }
     }
 
-    // Bloc ESP-NOW
-    uint32_t total = _get(_es.rxTotal);
-    if (_es.rxTotal) {
-      s += "[ESP-NOW] rx total="; s += String(total);
-      s += " ctrl=";  s += String(_get(_es.rxCtrl));
-      s += " data=";  s += String(_get(_es.rxData));
-      s += " jeté=";  s += String(_get(_es.rxJete));
-      s += " overflow="; s += String(_get(_es.rxOverflow));
-      s += "\n";
+    // Bloc ESP-NOW (seulement si attaché)
+    if (espNowAttache()) {
+      out.print(F("[ESP-NOW] rx total=")); out.print((unsigned long)_get(_es.rxTotal));
+      out.print(F(" ctrl="));  out.print((unsigned long)_get(_es.rxCtrl));
+      out.print(F(" data="));  out.print((unsigned long)_get(_es.rxData));
+      out.print(F(" jeté="));  out.print((unsigned long)_get(_es.rxJete));
+      out.print(F(" overflow=")); out.print((unsigned long)_get(_es.rxOverflow));
+      out.print('\n');
       if (_es.nbPeers) {
-        s += "  peers="; s += String(_get(_es.nbPeers));
-        s += " en-ligne="; s += String(_get(_es.enLigne));
+        out.print(F("  peers=")); out.print((unsigned)_get(_es.nbPeers));
+        out.print(F(" en-ligne=")); out.print((unsigned)_get(_es.enLigne));
       }
       char buf[24];
-      snprintf(buf, sizeof(buf), "%.0f%%", tauxPerteRx() * 100.0f);
-      s += " | perte="; s += buf;
-      snprintf(buf, sizeof(buf), "%.0f%%", tauxValiditeDonnees() * 100.0f);
-      s += " validité="; s += buf;
+      snprintf(buf, sizeof(buf), " | perte=%.0f%%", tauxPerteRx() * 100.0f);
+      out.print(buf);
+      snprintf(buf, sizeof(buf), " validité=%.0f%%", tauxValiditeDonnees() * 100.0f);
+      out.print(buf);
       uint32_t age = ageDerniereRecv();
-      s += " | dernière recv: ";
-      s += (age == 0xFFFFFFFF) ? "jamais" : String(age) + " s";
-      s += "\n";
+      out.print(F(" | dernière recv: "));
+      if (age == 0xFFFFFFFF) out.print(F("jamais"));
+      else { out.print((unsigned long)age); out.print(F(" s")); }
+      out.print('\n');
     }
 
     // Valeurs génériques
     for (uint8_t i = 0; i < _nbValeurs; i++) {
-      s += _valeurs[i].nom; s += ": ";
-      s += String(_valeurs[i].lire(), 1);
-      if (_valeurs[i].unite && _valeurs[i].unite[0]) { s += " "; s += _valeurs[i].unite; }
-      s += "\n";
+      out.print(_valeurs[i].nom); out.print(F(": "));
+      out.print((double)_valeurs[i].lire(), 1);
+      if (_valeurs[i].unite && _valeurs[i].unite[0]) { out.print(' '); out.print(_valeurs[i].unite); }
+      out.print('\n');
     }
 
     uint8_t sc = scoreGlobal();
-    s += "Score santé: "; s += String(sc); s += "/100 (";
-    s += (sc >= 60) ? "en santé" : "dégradé";
-    s += ")\n";
+    out.print(F("Score santé: ")); out.print((unsigned)sc); out.print(F("/100 ("));
+    out.print((sc >= 60) ? F("en santé") : F("dégradé"));
+    out.print(F(")\n"));
+  }
+
+  /** Rapport texte multi-lignes (valeur) — enveloppe de la version flux. */
+  String rapport() const {
+    String s;
+    Sante_StringPrint sp(s);
+    rapport(sp);
     return s;
   }
 
-  /** Résumé sur une ligne (heartbeat debug). */
-  String resume() const {
-    char buf[32];
-    String s = _nom; s += " ";
-    if (_uptime) { s += "up="; s += String(*_uptime, 0); s += "s "; }
-    if (_rssi)   { s += "rssi="; s += String(*_rssi); s += "dBm "; }
-    if (_wifi.connecte) { s += _wifi.connecte() ? "wifi=OK " : "wifi=KO "; }
-    if (_heap)   { s += "heap="; s += String(*_heap); s += " "; }
-    if (_es.rxTotal) {
-      s += "espnow: data="; s += String(_get(_es.rxData));
-      s += " jeté="; s += String(_get(_es.rxJete));
-      s += " ovf="; s += String(_get(_es.rxOverflow));
-      snprintf(buf, sizeof(buf), " perte=%.0f%%", tauxPerteRx() * 100.0f); s += buf;
-      s += " peers="; s += String(_get(_es.enLigne)); s += "/"; s += String(_get(_es.nbPeers));
+  /** Résumé sur une ligne — version FLUX (v1.1.0-local). Aucune String allouée. */
+  void resume(Print& out) const {
+    char buf[40];
+    out.print(_nom); out.print(' ');
+    if (uptimePresent()) { out.print(F("up=")); out.print((double)uptimeVal(), 0); out.print(F("s ")); }
+    if (rssiPresente())  { out.print(F("rssi=")); out.print((int)rssiVal()); out.print(F("dBm ")); }
+    if (_wifi.connecte) { out.print(_wifi.connecte() ? F("wifi=OK ") : F("wifi=KO ")); }
+    if (heapPresent())   { out.print(F("heap=")); out.print((unsigned long)heapVal()); out.print(' '); }
+    if (espNowAttache()) {
+      out.print(F("espnow: data=")); out.print((unsigned long)_get(_es.rxData));
+      out.print(F(" jeté=")); out.print((unsigned long)_get(_es.rxJete));
+      out.print(F(" ovf=")); out.print((unsigned long)_get(_es.rxOverflow));
+      snprintf(buf, sizeof(buf), " perte=%.0f%%", tauxPerteRx() * 100.0f);
+      out.print(buf);
+      out.print(F(" peers=")); out.print((unsigned)_get(_es.enLigne));
+      out.print('/'); out.print((unsigned)_get(_es.nbPeers));
     }
-    s += " score="; s += String(scoreGlobal()); s += "/100";
+    out.print(F(" score=")); out.print((unsigned)scoreGlobal()); out.print(F("/100"));
+  }
+
+  /** Résumé sur une ligne (valeur) — enveloppe de la version flux. */
+  String resume() const {
+    String s;
+    Sante_StringPrint sp(s);
+    resume(sp);
     return s;
   }
 
@@ -307,9 +400,9 @@ public:
   void json(T&& obj) const {
     obj["nom"] = _nom;
     obj["version"] = _version;
-    if (_uptime) obj["uptime_s"] = *_uptime;
-    if (_rssi)   obj["rssi_moy_dbm"] = *_rssi;
-    if (_heap)   obj["heap_libre"] = *_heap;
+    if (uptimePresent()) obj["uptime_s"] = uptimeVal();
+    if (rssiPresente())  obj["rssi_moy_dbm"] = rssiVal();
+    if (heapPresent())   obj["heap_libre"] = heapVal();
     obj["score_sante"] = scoreGlobal();
     obj["en_sante"] = enSante();
     if (_wifi.connecte) obj["wifi_connecte"] = _wifi.connecte();
@@ -338,11 +431,22 @@ private:
   static uint32_t _get(uint32_t (*f)()) { return f ? f() : 0; }
   static uint8_t  _get(uint8_t (*f)())  { return f ? f() : 0; }
 
+  // ── Accès unifié getter > pointeur (v1.1.0-local) ──────────────────────
+  bool heapPresent() const   { return _heapGet != nullptr || _heap != nullptr; }
+  bool rssiPresente() const  { return _rssiGet != nullptr || _rssi != nullptr; }
+  bool uptimePresent() const { return _uptimeGet != nullptr || _uptime != nullptr; }
+  uint32_t heapVal() const   { return _heapGet ? _heapGet() : (_heap ? *_heap : 0); }
+  int8_t   rssiVal() const   { return _rssiGet ? _rssiGet() : (_rssi ? *_rssi : 0); }
+  float    uptimeVal() const { return _uptimeGet ? _uptimeGet() : (_uptime ? *_uptime : 0.0f); }
+
   const char* _nom = "";
   const char* _version = "";
   float* _uptime = nullptr;
   int8_t* _rssi = nullptr;
   uint32_t* _heap = nullptr;
+  float    (*_uptimeGet)() = nullptr;
+  int8_t   (*_rssiGet)()   = nullptr;
+  uint32_t (*_heapGet)()   = nullptr;
   EspNowSante _es;
   WiFiSante _wifi;
 
@@ -355,7 +459,12 @@ private:
   float _perteMax = 0.50f;
 };
 
-// Instance globale — inclusion UNIQUE par projet (comme espNowTR_sharedVar)
-Sante_iOT sante_iOT;
+// ⚠️ B3 — L'INSTANCE GLOBALE `Sante_iOT sante_iOT;` A ÉTÉ RETIRÉE (v1.1.0-local).
+//    Déclarée en fin d'en-tête SANS `inline`, elle produisait une définition par
+//    unité de compilation qui inclut le header → erreur de linkage dès que le
+//    projet a deux .cpp (ou un .ino + un .cpp). `inline` n'est pas une option :
+//    le core arduino-esp32 2.0.17 compile en `gnu++11`, où les variables
+//    `inline` (C++17) n'existent pas.
+//    → Déclarer l'instance dans le programme : `Sante_iOT sante;`
 
 #endif // SANTE_IOT_H

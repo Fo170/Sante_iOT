@@ -90,6 +90,9 @@ void loop() {
 |---------|-------------|
 | `setNom()` / `setVersion()` | Identité du nœud. |
 | `setUptimePtr()` / `setRssiMoyPtr()` / `setHeapPtr()` | Pointeurs sur variables applicatives. |
+| `setUptimeGetter()` / `setRssiGetter()` / `setHeapGetter()` | **Getters** (prioritaires sur les pointeurs) — évitent une globale miroir à maintenir à jour. |
+| `espNowAttache()` / `receptionAttachee()` | Indique si des compteurs ESP-NOW sont attachés (les pénalités ESP-NOW ne s'appliquent que dans ce cas). |
+| `rapport(Print&)` / `resume(Print&)` | Sorties **en flux** (zéro allocation) — `Serial`, client HTTP, etc. |
 | `attacherEspNow(EspNowSante)` | Compteurs ESP-NOW (pointeurs de fonction). |
 | `attacherWiFi(WiFiSante)` | Infos/logs WiFiManagerESP (v0.7.9+). |
 | `ajouterValeur(nom, getter, unité)` | Valeur générique enregistrable (max 8). |
@@ -114,4 +117,57 @@ void loop() {
 
 | Version | Date | Changements |
 |---------|------|-------------|
+| v1.1.0 | 2026-10 | **3 défauts corrigés** (prouvés par test hôte) — voir ci-dessous. Getters, sorties `Print&`, `espNowAttache()`. Instance globale retirée de l'en-tête. |
 | v1.0.0 | 2026-08 | Création : compteurs ESP-NOW (espNow_SharedVar v1.0.4), pointeurs applicatifs (t_fct, rssi_moy, heap), infos/logs WiFiManagerESP v0.7.9, valeurs génériques, score 0-100, sorties texte/résumé/JSON. |
+
+## Correctifs v1.1.0 — pourquoi cette version
+
+Les trois défauts ci-dessous rendaient la librairie **inutilisable hors
+ESP-NOW**, et l'un d'eux faisait **mentir** l'indicateur dans le sens
+dangereux. Ils ont été trouvés en écrivant le test hôte `sante_score.cpp`.
+
+### B1 — Sous-débordement `uint8_t` : une carte dégradée s'annonçait PARFAITE
+
+```cpp
+// v1.0.1 — le score partait de 100 et on RETIRAIT des points en uint8_t
+s = (uint8_t)(s - 15);        // s = 0  →  241
+if (s > 100) s = 100;         // 241    →  100
+```
+
+Reproduit sur la version d'origine : une carte à **−110 dBm** avec **25 % de
+données valides** retournait **100/100**. C'est le pire défaut possible pour un
+indicateur de santé — il rassure quand il faudrait alerter.
+
+Corrigé : arithmétique **signée** (`int16_t`), bornage bas explicite, et
+sémantique « 100 moins les pénalités » — **aucun critère ne peut remonter le
+score** (les anciennes affectations `s = 40` / `s = 30` écrasaient les
+pénalités précédentes).
+
+### B2 — ESP-NOW imposé : toute carte sans ESP-NOW plafonnait à 20/100
+
+`ageDerniereRecv()` renvoie `0xFFFFFFFF` quand aucun compteur n'est attaché, et
+le score appliquait `s = 20`. Résultat : les cartes **sans ESP-NOW**
+(ESP32_TELEGRAM, thermomètres, relais…) étaient **toujours** « dégradées » et
+`enSante()` était **toujours** faux.
+
+Corrigé : les pénalités ESP-NOW ne s'appliquent que si `espNowAttache()`.
+
+### B3 — Instance globale non `inline` dans l'en-tête
+
+`Sante_iOT sante_iOT;` en fin de header produisait **une définition par unité
+de compilation** → erreur de linkage dès deux `.cpp`. `inline` (C++17) n'est pas
+une option : le core arduino-esp32 2.0.17 compile en `gnu++11`.
+
+Corrigé : l'instance est déclarée dans le programme (`Sante_iOT sante;`).
+
+### Bonus — les getters
+
+Les pointeurs (`setHeapPtr(&ma_globale)`) obligeaient le programme à maintenir
+une globale à jour à chaque boucle pour une valeur déjà lisible à la demande :
+
+```cpp
+sante.setHeapGetter([]() -> uint32_t { return CM_Mesure().libre; });
+sante.setRssiGetter([]() -> int8_t   { return wifiManager.getRSSI(); });
+```
+
+Priorité : **getter > pointeur** si les deux sont fournis.
