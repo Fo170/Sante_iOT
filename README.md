@@ -105,6 +105,16 @@ void loop() {
 | `resume()` | Résumé sur une ligne. |
 | `json(obj)` | Remplit un objet ArduinoJson v7. |
 
+## Dimensionnement (compile-time)
+
+| Macro | Défaut | Effet |
+|---|---|---|
+| `SANTE_MAX_VALEURS` | 8 | Emplacements de `ajouterValeur()` — 12 o de RAM statique chacun. `0` supprime la table. |
+
+```ini
+build_flags = -D SANTE_MAX_VALEURS=0   ; projet qui n'utilise pas ajouterValeur()
+```
+
 ## Seuils (défauts)
 
 | Seuil | Défaut | Via |
@@ -117,6 +127,7 @@ void loop() {
 
 | Version | Date | Changements |
 |---------|------|-------------|
+| v1.2.0 | 2026-10 | **`SANTE_MAX_VALEURS` devient une macro surchargeable** (`-D`, défaut 8, comportement inchangé). La table `_valeurs[]` coûtait 12 o par emplacement même quand le projet n'enregistre aucune valeur : sur un ESP8266 à ~3,5 Ko de heap, 84 o de RAM statique se paient en heap. `-D SANTE_MAX_VALEURS=0` la supprime (mesuré : `sizeof(Sante_iOT)` 384 → 216 o sur hôte 64 bits) et `ajouterValeur()` renvoie alors `false` sans warning `-Wtype-limits`. |
 | v1.1.0 | 2026-10 | **3 défauts corrigés** (prouvés par test hôte) — voir ci-dessous. Getters, sorties `Print&`, `espNowAttache()`. Instance globale retirée de l'en-tête. |
 | v1.0.0 | 2026-08 | Création : compteurs ESP-NOW (espNow_SharedVar v1.0.4), pointeurs applicatifs (t_fct, rssi_moy, heap), infos/logs WiFiManagerESP v0.7.9, valeurs génériques, score 0-100, sorties texte/résumé/JSON. |
 

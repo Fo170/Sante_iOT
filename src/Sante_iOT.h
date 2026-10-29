@@ -80,8 +80,20 @@
 
 
 // Version de la librairie (source UNIQUE — agrégée par liste_lib.h)
-#define __SANTE_IOT_H_VERSION__ "1.1.0"
+#define __SANTE_IOT_H_VERSION__ "1.2.0"
 #include <Arduino.h>
+
+// ────────────────────────────────────────────────────────────────
+// DIMENSIONNEMENT (compile-time, surchargeable par -D)
+// v1.2.0 : la table des « valeurs génériques » était figée à 8 emplacements
+// de 12 o (96 o statiques) même pour un projet qui n'en enregistre AUCUNE.
+// Elle devient réglable, comme les autres librairies Fo170.
+//   0  = aucune valeur enregistrable (ajouterValeur() renvoie false)
+//   8  = défaut, comportement de la v1.1.0
+// ────────────────────────────────────────────────────────────────
+#ifndef SANTE_MAX_VALEURS
+#define SANTE_MAX_VALEURS 8
+#endif
 
 // ----------------------------------------------------------------------------
 // StringPrint — adaptateur `Print` → `String`
@@ -173,9 +185,15 @@ public:
     const char* unite;
   };
   bool ajouterValeur(const char* nom, float (*lire)(), const char* unite = "") {
+#if SANTE_MAX_VALEURS == 0
+    // v1.2.0 : table désactivée à la compilation (-D SANTE_MAX_VALEURS=0).
+    (void)nom; (void)lire; (void)unite;
+    return false;
+#else
     if (!nom || !lire || _nbValeurs >= SANTE_MAX_VALEURS) return false;
     _valeurs[_nbValeurs++] = { nom, lire, unite };
     return true;
+#endif
   }
 
   // --------------------------------------------------------------------------
@@ -450,8 +468,15 @@ private:
   EspNowSante _es;
   WiFiSante _wifi;
 
-  static const uint8_t SANTE_MAX_VALEURS = 8;
-  Valeur _valeurs[SANTE_MAX_VALEURS];
+  // v1.2.0 — SANTE_MAX_VALEURS devient une MACRO surchargeable par -D, comme
+  // toutes les autres constantes de dimensionnement Fo170 (WiFiManagerESP,
+  // Syslog_UDP, BatteryKalman…). Motif : la table `_valeurs[]` coûte
+  // 12 o par emplacement SURTOUT quand le programme n'en enregistre aucune ;
+  // sur un ESP8266 à ~3,5 Ko de heap, 84 o de RAM statique se paient en heap.
+  // La valeur par défaut reste 8 : aucun changement de comportement.
+  // `[MAX > 0 ? MAX : 1]` évite un tableau de taille nulle (illégal en C++)
+  // quand un projet pose -D SANTE_MAX_VALEURS=0.
+  Valeur _valeurs[SANTE_MAX_VALEURS > 0 ? SANTE_MAX_VALEURS : 1];
   uint8_t _nbValeurs = 0;
 
   uint32_t _heapMin = 20000;

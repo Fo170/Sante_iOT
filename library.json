@@ -1,6 +1,6 @@
 {
   "name": "Sante_iOT",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "État de santé d'un iOT (header-only) : agrège compteurs ESP-NOW (optionnels), variables applicatives via getters ou pointeurs, infos/logs WiFiManagerESP et valeurs génériques enregistrables. Score de santé 0-100 + seuils configurables. Sorties texte/résumé en flux (Print&, zéro allocation) ou en String, et JSON ArduinoJson v7.",
   "keywords": [
     "health",
